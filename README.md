@@ -15,9 +15,15 @@ scripts/prepare_data.py         # A-06
 scripts/merge_registry.py       # gộp run_record.json -> results/registry.csv
 notebooks/kaggle_template.ipynb # notebook mẫu Kaggle (A-09); bản .py cùng nội dung để review diff
 results/registry.csv            # registry kết quả — nguồn duy nhất cho số liệu trong luận văn
-tests/                          # python -m pytest -q tests/
-# Sẽ viết ở phiên tái lập (P2): src/khoaluan/train/, src/khoaluan/eval/, src/khoaluan/probe/ (LR/CCS)
-# Sẽ viết ở P3–P4: src/khoaluan/erase/, src/khoaluan/stats/
+src/khoaluan/data/load.py       # P2: đọc đầu ra prepare_data v1.2 + kiểm vân tay lần A-06 chính thức
+src/khoaluan/train/finetune.py  # P2/S2: fine-tune (HF Trainer v5; chốt chặn 1 GPU, batch 8, số bước)
+src/khoaluan/eval/{forward,metrics}.py  # P2: inference (logits theo uid, pooler = L_out), contrast pair, chỉ số HANS, Q4
+src/khoaluan/probe/lr.py        # P2/S3: LR faithful (DLK) + robust; chẩn đoán lưu fp16
+src/khoaluan/p2.py              # điều phối một mô hình: train -> infer -> contrast -> lr
+scripts/run_p2.py               # CUDA_VISIBLE_DEVICES=0 python scripts/run_p2.py --data mnliB --size 16000 --seed 11 ...
+notebooks/kaggle_p2.ipynb       # notebook P2 (bản .py cùng nội dung)
+tests/                          # python -m pytest -q tests/   (test_p2.py: BERT 2 tầng, CPU, offline)
+# Chưa viết: CCS, D-R1, D-R2 (CPU từ cache, sau pilot); P3–P4: src/khoaluan/erase/, src/khoaluan/stats/
 ```
 
 ## Quy tắc
