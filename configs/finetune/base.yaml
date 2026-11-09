@@ -1,0 +1,24 @@
+# SPEC_REPRODUCE_VDL.md v1.0 §3.2 — cấu hình fine-tune chung. Mỗi run chỉ ghi đè: size, data, seed.
+# KHÔNG sửa giá trị ở đây khi chưa cập nhật SPEC (D-01).
+model_name: google-bert/bert-large-cased
+num_labels: 2            # 0 = entailment, 1 = non-entailment
+max_length: 128
+learning_rate: 2.0e-5
+per_device_train_batch_size: 8
+num_train_epochs: 5
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+weight_decay: 0.0
+lr_scheduler_type: linear
+warmup_steps: 0
+fp16: true
+eval_strategy: "no"
+save_strategy: "no"
+logging_steps: 50
+report_to: none
+data_seed_split: 1234    # seed tách dữ liệu (D-16), KHÁC seed huấn luyện
+train_seeds:
+  M-16K: [11, 22, 33, 44, 55]
+  M-MIX: [11, 22, 33]
+  default: [11, 22, 33]

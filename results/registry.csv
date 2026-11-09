@@ -1,0 +1,1 @@
+run_id,kind,git_commit,config_sha256,data_manifest_sha256,seed,data_seed,kaggle_account,kaggle_notebook_version,gpu_name,torch,transformers,start_utc,wall_minutes,train_loss_final,devm_acc,devmm_acc,hans_E_LO,hans_E_SUB,hans_E_CON,hans_NE_LO,hans_NE_SUB,hans_NE_CON,truncation_rate,degenerate,notes

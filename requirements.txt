@@ -1,0 +1,5 @@
+# Image Kaggle đã có: torch, transformers, datasets, accelerate, scikit-learn, numpy, pandas, pyarrow, scipy, pyyaml.
+# KHÔNG cài lại các gói đó (dễ lệch CUDA). Chỉ cài thêm:
+concept-erasure==0.2.4
+pytest
+# Phiên bản thật của mọi gói được chốt trong requirements.lock (sinh bởi scripts/env_check.py ở lần chạy đầu).
