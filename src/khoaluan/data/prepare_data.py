@@ -14,6 +14,10 @@ Chạy trên Kaggle (CPU là đủ, BẬT Internet):
     manifest.json   (đầy đủ, máy đọc)
     A06_summary.txt (tóm tắt để dán lại cho Claude / vào root §6)
 Changelog:
+  v1.2 (09/11/2026): pairID MNLI KHÔNG duy nhất (lần chạy A-06 đầu tiên trên Kaggle: 5,614 dòng trùng trong train nhị phân)
+                     -> uid MNLI = "<split>:r<chỉ số dòng trong split HF gốc>"; ghim + ghi revision HF;
+                     khử trùng lặp cặp câu (bỏ nhóm mâu thuẫn nhãn, giữ bản đầu) TRƯỚC khi chia FT/POOL;
+                     chẩn đoán trùng pairID và rò rỉ dev∩train vào manifest.
   v1.1 (05/11/2026): uid có tiền tố nguồn; kiểm khớp parse–văn bản (MNLI); tỉ lệ parse lỗi; vân tay dữ liệu;
                      SMD trước ghép; mẫu kiểm tay A-14; bỏ cột *_binary_parse; A06_summary.txt.
   v1.0 (04/11/2026): bản đầu.
@@ -108,17 +112,33 @@ def split_hans_train(ht, n_a, seed):
 
 
 # ----------------------------------------------------------------- MNLI
+HF_DATASET = "nyu-mll/multi_nli"
+
+
+def resolve_hf_revision(revision=None):
+    """Trả về mã commit (sha) của dataset trên HF Hub để ghim; None nếu không tra được."""
+    try:
+        from huggingface_hub import HfApi
+        return HfApi().dataset_info(HF_DATASET, revision=revision).sha
+    except Exception as e:  # không chặn chạy, nhưng ghi lại
+        log(f"CẢNH BÁO: không tra được revision HF ({type(e).__name__})")
+        return None
+
+
 def load_mnli(revision=None):
     import datasets
     from datasets import load_dataset
-    kw = {"revision": revision} if revision else {}
-    ds = load_dataset("nyu-mll/multi_nli", **kw)
-    meta = {"datasets_version": datasets.__version__, "hf_revision_arg": revision,
+    sha = resolve_hf_revision(revision)
+    use_rev = sha or revision
+    ds = load_dataset(HF_DATASET, **({"revision": use_rev} if use_rev else {}))
+    meta = {"datasets_version": datasets.__version__, "hf_revision_arg": revision, "hf_revision_resolved": sha,
             "raw_split_sizes": {s: len(ds[s]) for s in ds}}
     out = {}
     for split in ["train", "validation_matched", "validation_mismatched"]:
         df = ds[split].to_pandas()
+        df["row_idx"] = np.arange(len(df))              # định danh ổn định khi revision được ghim
         meta[f"fingerprint_raw_{split}"] = fingerprint(zip(df.pairID, df.label))
+        meta[f"pairID_dup_rows_raw_{split}"] = int(df.pairID.duplicated().sum())
         df = df[df.label.isin([0, 2])].copy()           # HF: 0 E, 1 N, 2 C, -1 không nhãn
         df["y"] = (df.label == 2).astype(int)           # 0 = E, 1 = C (non-entailment)
         df = df.drop(columns=[c for c in df.columns if c.endswith("binary_parse")])
@@ -126,9 +146,44 @@ def load_mnli(revision=None):
     return out, meta
 
 
+def pair_key(df):
+    return df.premise.map(norm_str) + "\t" + df.hypothesis.map(norm_str)
+
+
+def pairid_dup_report(df, n_examples=3):
+    """Chẩn đoán trùng pairID: bao nhiêu nhóm trùng có cùng văn bản (bản sao) vs khác văn bản (ID tái dùng)."""
+    sub = df[df.pairID.duplicated(keep=False)].assign(_k=pair_key)
+    per = sub.groupby("pairID")["_k"].nunique()
+    ex = []
+    for pid in list(per[per > 1].index[:n_examples]):
+        g = sub[sub.pairID == pid]
+        ex.append({"pairID": str(pid), "rows": [[str(r.premise)[:70], str(r.hypothesis)[:70], int(r.y)]
+                                                for r in g.itertuples()][:3]})
+    return {"dup_rows_incl_first": int(len(sub)), "dup_groups": int(len(per)),
+            "groups_same_text": int((per == 1).sum()), "groups_diff_text": int((per > 1).sum()),
+            "examples_diff_text": ex}
+
+
+def dedupe_mnli(df):
+    """Khử trùng lặp theo cặp (premise, hypothesis) chuẩn hoá:
+    - nhóm có nhãn mâu thuẫn (E và C) -> bỏ toàn bộ nhóm (không biết nhãn đúng);
+    - nhóm cùng nhãn -> giữ dòng đầu (theo row_idx).
+    Lý do: tránh cùng một cặp câu vừa nằm trong tập fine-tune vừa nằm trong MNLI-POOL (rò rỉ)."""
+    df = df.sort_values("row_idx").reset_index(drop=True)
+    key = pair_key(df)
+    n_lab = df.groupby(key)["y"].transform("nunique")
+    conflict = n_lab > 1
+    keep = ~conflict & ~key.duplicated(keep="first")
+    stats = {"rows_in": int(len(df)), "conflict_rows_dropped": int(conflict.sum()),
+             "conflict_groups": int(key[conflict].nunique()),
+             "exact_dup_rows_dropped": int((~conflict & key.duplicated(keep="first")).sum()),
+             "rows_out": int(keep.sum())}
+    return df[keep].reset_index(drop=True), stats
+
+
 def add_mnli_cols(df, source):
     df = df.copy()
-    df["uid"] = source + ":" + df["pairID"].astype(str)
+    df["uid"] = source + ":r" + df["row_idx"].astype(str)   # KHÔNG dùng pairID (không duy nhất trong MNLI)
     df["c4"] = [c4(p, h, pp) for p, h, pp in zip(df.premise, df.hypothesis, df.premise_parse)]
     df["con_anynode"] = [is_con_anynode(pp, h) for pp, h in zip(df.premise_parse, df.hypothesis)]
     df["parse_aligned"] = [parse_alignment(p, pp) for p, pp in zip(df.premise, df.premise_parse)]
@@ -173,6 +228,8 @@ def handcheck_sample(pool, out_dir, seed=7):
         k = min(50, len(df))
         if k:
             parts.append(df.iloc[rng.choice(len(df), size=k, replace=False)].assign(machine=g))
+    if not parts:
+        return {g: 0 for g in groups}
     s = pd.concat(parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
     s["hc_id"] = [f"hc{i:03d}" for i in range(len(s))]
     blind = s[["hc_id", "premise", "hypothesis"]].copy()
@@ -193,7 +250,7 @@ def main():
     ap.add_argument("--skip-mnli", action="store_true", help="chỉ xử lý HANS (kiểm thử offline)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    man = {"script_version": "1.1", "data_seed": args.data_seed, "hans_commit": HANS_COMMIT,
+    man = {"script_version": "1.2", "data_seed": args.data_seed, "hans_commit": HANS_COMMIT,
            "python": sys.version.split()[0], "pandas": pd.__version__, "numpy": np.__version__}
 
     # ---- HANS
@@ -225,13 +282,22 @@ def main():
         log("MNLI: tải từ HF nyu-mll/multi_nli (cần Internet)")
         m, meta = load_mnli(args.hf_revision)
         man["mnli_source"] = meta
+        man["mnli_pairID_dup_report_train_binary"] = pairid_dup_report(m["train"])
+        tr_clean, man["mnli_dedupe_train"] = dedupe_mnli(m["train"])
+        keys_tr = set(pair_key(tr_clean))
+        man["mnli_dev_in_train_pairs"] = {
+            "dev_m": int(pair_key(m["validation_matched"]).isin(keys_tr).sum()),
+            "dev_mm": int(pair_key(m["validation_mismatched"]).isin(keys_tr).sum())}
+        log(f"MNLI: khử trùng lặp {man['mnli_dedupe_train']}")
         log("MNLI: tính đặc trưng (train ~262K dòng nhị phân; vài phút)")
-        tr = add_mnli_cols(m["train"], "mnli_train")
+        tr = add_mnli_cols(tr_clean, "mnli_train")
         dm = add_mnli_cols(m["validation_matched"], "mnli_dev_m")
         dmm = add_mnli_cols(m["validation_mismatched"], "mnli_dev_mm")
-        if not tr.uid.is_unique:
-            dup = int(tr.uid.duplicated().sum())
-            sys.exit(f"[DỪNG] pairID MNLI train không duy nhất ({dup} trùng) — báo lại cho Claude")
+        for name, d in [("train", tr), ("dev_m", dm), ("dev_mm", dmm)]:
+            if not d.uid.is_unique:
+                sys.exit(f"[DỪNG] uid {name} không duy nhất — lỗi logic, báo lại cho Claude")
+        if len(tr) <= max(FT_SIZES):
+            sys.exit(f"[DỪNG] MNLI train nhị phân sau khử trùng chỉ còn {len(tr)} dòng — bất thường, báo lại cho Claude")
         rng = np.random.default_rng(args.data_seed)
         tr["ft_rank"] = rng.permutation(len(tr))       # tập con lồng nhau: ft_rank < N
         for n in FT_SIZES:
@@ -284,7 +350,8 @@ def main():
 
 def write_summary(man, path):
     keys = ["script_version", "data_seed", "hans_extractor_agreement", "hans_train_eval_pair_overlap", "hans_counts",
-            "mnli_source", "mnli_counts", "fingerprint_ft16k", "fingerprint_hans_A", "mnli_parse_quality",
+            "mnli_source", "mnli_pairID_dup_report_train_binary", "mnli_dedupe_train", "mnli_dev_in_train_pairs",
+            "mnli_counts", "fingerprint_ft16k", "fingerprint_hans_A", "mnli_parse_quality",
             "A06_2x2_pool", "A06_2x2_dev_m", "A06_covariates_pool", "A06_negdrop_rate_pool",
             "A06_SMD_before_matching_pool", "A06_rare_cell", "A06_decision", "A14_handcheck_counts"]
     with open(path, "w") as f:
