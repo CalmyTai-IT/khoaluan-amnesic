@@ -130,7 +130,13 @@ def test_verify_data_pass_and_fail(data_dir, tmp_path):
 
 
 def test_find_data_dir(data_dir, tmp_path):
-    assert L.find_data_dir(os.path.dirname(data_dir)) == data_dir
+    import shutil
+    inner = tmp_path / "root" / "a" / "data"          # cây thư mục riêng: không phụ thuộc fixture của file test khác
+    inner.mkdir(parents=True)
+    for f in ("manifest.json", "ft_uids_16000.txt"):
+        shutil.copy(os.path.join(data_dir, f), inner / f)
+    assert L.find_data_dir(str(tmp_path / "root")) == str(inner)
+    assert L.find_data_dir(data_dir) == data_dir
 
 
 def test_train_frames(data_dir):
