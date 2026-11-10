@@ -1,18 +1,21 @@
 """
-p2.py — chạy MỘT mô hình của P2 (S2 + S3) theo SPEC_REPRODUCE_VDL v1.1: fine-tune -> inference -> contrast pair -> LR.
+p2.py — chạy MỘT mô hình của P2 (S2 + S3) theo SPEC_REPRODUCE_VDL v1.1.
 
     CUDA_VISIBLE_DEVICES=0 python scripts/run_p2.py --data-root /kaggle/input --out-root /kaggle/working/out \
         --data mnliB --size 16000 --seed 11 --account TV-B
 
-Stage (--stages, mặc định train,infer,contrast,lr):
-  train    : fine-tune (base.yaml), lưu checkpoint nếu là M-16K / M-MIX (D-15, SPEC §2.2)
+Stage (--stages, mặc định train,infer,contrast,lr,ccs,dr1; M-PT tự bỏ train):
+  train    : fine-tune 5 epoch cố định (base.yaml); lưu checkpoint cho M-16K / M-MIX (D-15, SPEC §2.2);
+             DỪNG SỚM nếu run thoái hoá (finetune.py: n ≥ 8K, loss nửa sau epoch 1 ≥ 0.65)
   infer    : DEV-M, DEV-MM, HANS-EVAL (+ HT-B cho mô hình giữ checkpoint): logits theo uid, chỉ số, Q4;
              cache pooler_output (= L_out) + [CLS] tầng 20–24 (fp16) cho S4–S5 (SPEC §5.4)
-  contrast : contrast pair DEV-M (toàn bộ) + HANS-EVAL 10K phân tầng: [CLS] mọi tầng (mô hình then chốt) hoặc 20–24,
-             token cuối + mean tầng 20–24 (mô hình then chốt) — SPEC §5.2–5.4
+  contrast : contrast pair DEV-M (toàn bộ) + HANS-EVAL 10K phân tầng: [CLS] mọi tầng (mô hình then chốt) hoặc 20–24;
+             token cuối + mean ở tầng 23–24 (mô hình then chốt, cho D-R4). Tính và lưu fp32.
   lr       : LR faithful + robust, 5 lần, mọi tầng đã cache; chẩn đoán lưu fp16 — SPEC §6.1
-Đầu ra: <out-root>/<run_id>/ ; p2_summary.txt để dán lại cho Claude; run_record.json cho registry.
-CCS, D-R1, D-R2 chạy sau trên CPU từ cache (không nằm trong pilot).
+  ccs      : CCS tuyến tính (DLK) mọi tầng đã cache; thêm MLP ở tầng 23–24 — SPEC §6.2
+  dr1      : D-R1 (LR-HANS khi test là subcase chưa thấy, so với chia ngẫu nhiên cùng cỡ) tầng 20–24 — SPEC §8
+Run thoái hoá (dừng sớm, hoặc DEV-M < 0.60 với n ≥ 1K): ghi bản ghi, BỎ các stage sau; hàng đợi chạy lại seed+100.
+Đầu ra: <out-root>/<run_id>/ ; p2_summary.txt; p2_metrics.json; run_record.json cho registry.
 """
 import os
 
@@ -34,12 +37,20 @@ from khoaluan.data import load as L  # noqa: E402
 from khoaluan.eval import metrics as M  # noqa: E402
 from khoaluan.utils.registry import now_utc, sha256_file, write_run_record  # noqa: E402
 
-KEY_MODELS = {("pt", 0, 0), ("mnliB", 8000, 11), ("mnliB", 16000, 11), ("mix", 16000, 11)}  # SPEC §5.4
+ALL_STAGES = ["train", "infer", "contrast", "lr", "ccs", "dr1"]
 SIZE_TAG = {25: "25", 100: "100", 1000: "1k", 8000: "8k", 16000: "16k"}
 # Mốc LR tầng 23 (bảng phụ lục V&dL, Bảng 2–3; M-PT theo văn bản §4.3.1) — SPEC_REPRODUCE §7.1
 REF_LR23 = {"pt": (0.59, 0.61), "25": (0.59, 0.67), "100": (0.58, 0.68), "1k": (0.71, 0.70),
             "8k": (0.73, 0.58), "16k": (0.86, 0.72), "mix": (0.83, 0.83)}
 T0 = time.time()
+
+
+def is_key_model(data, size, seed):
+    """Mô hình then chốt (SPEC §5.4): M-PT và seed 11 của M-8K, M-16K, M-MIX — KỂ CẢ bản chạy lại seed+100
+    (111, 211, …) khi seed 11 thoái hoá (SPEC §3.3). Mô hình then chốt: contrast mọi tầng + token cuối/mean."""
+    if data == "pt":
+        return True
+    return (data == "mix" or size in (8000, 16000)) and seed % 100 == 11
 
 
 def log(msg):
@@ -53,21 +64,23 @@ def parse_args(argv=None):
     ap.add_argument("--data", choices=["mnliB", "mix", "pt"], required=True)
     ap.add_argument("--size", type=int, default=0, help="25|100|1000|8000|16000 (mix: 16000; pt: bỏ qua)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--stages", default="train,infer,contrast,lr")
+    ap.add_argument("--stages", default=",".join(ALL_STAGES))
     ap.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "..", "..", "configs", "finetune",
                                                       "base.yaml"))
     ap.add_argument("--set", action="append", default=[], help="ghi đè cấu hình key=value (CHỈ dùng cho test)")
     ap.add_argument("--account", default=None, help="TV-A | TV-B")
     ap.add_argument("--run-suffix", default="", help="ví dụ -rep2 cho chạy lặp kiểm S0")
     ap.add_argument("--model-dir", default=None, help="checkpoint đã fine-tune (khi không có stage train)")
-    ap.add_argument("--cache-dir", default=None, help="đọc cache contrast từ thư mục khác (stage lr chạy riêng)")
+    ap.add_argument("--cache-dir", default=None, help="đọc cache contrast từ thư mục khác (lr/ccs/dr1 chạy riêng)")
     ap.add_argument("--save-model", choices=["auto", "yes", "no"], default="auto")
     ap.add_argument("--std-reps", choices=["auto", "yes", "no"], default="auto")
     ap.add_argument("--std-layers", default="20-24")
     ap.add_argument("--cp-layers", choices=["auto", "all", "20-24"], default="auto")
+    ap.add_argument("--aux-layers", default="23-24", help="tầng cho token cuối/mean (mô hình then chốt)")
     ap.add_argument("--cp-dtype", choices=["float32", "float16"], default="float32")
     ap.add_argument("--hans-cp-n", type=int, default=10000)
     ap.add_argument("--lr-layers", default="all", help="all | danh sách, ví dụ 20-24 hoặc 23,24")
+    ap.add_argument("--dr1-layers", default="20-24")
     ap.add_argument("--infer-batch", type=int, default=64)
     ap.add_argument("--cp-batch", type=int, default=64)
     ap.add_argument("--allow-unofficial-data", action="store_true",
@@ -127,13 +140,43 @@ def write_uids(path, uids):
         f.write("\n".join(uids))
 
 
+def load_cp(cdir, s):
+    """Đọc cache contrast của tập s: (meta, h_yes, h_no, y, splits) — splits giống hệt nhau cho LR và CCS."""
+    from khoaluan.probe import lr as P
+    meta = pd.read_parquet(os.path.join(cdir, f"cp_{s}_meta.parquet"))
+    hy = np.load(os.path.join(cdir, f"cp_{s}_cls_yes.npy"), mmap_mode="r")
+    hn = np.load(os.path.join(cdir, f"cp_{s}_cls_no.npy"), mmap_mode="r")
+    y = meta.y.to_numpy()
+    splits = P.splits_mnli(y) if s == "dev_m" else P.splits_hans(meta.heuristic + "|" + meta.y.astype(str))
+    return meta, hy, hn, y, splits
+
+
+def layer_report(summ, variant, layers):
+    """Bảng gọn ở tầng 23/24 cho p2_summary."""
+    out = {}
+    for l in [x for x in (23, 24) if x in layers]:
+        f = summ[(summ.layer == l) & (summ.variant == variant)].set_index("dataset")
+        if {"dev_m", "hans_eval"} <= set(f.index):
+            out[f"L{l}"] = {"MNLI": round(float(f.loc["dev_m", "acc_mean"]), 4),
+                            "HANS": round(float(f.loc["hans_eval", "acc_mean"]), 4),
+                            "SD_MNLI_HANS": [round(float(f.loc["dev_m", "acc_sd"]), 4),
+                                             round(float(f.loc["hans_eval", "acc_sd"]), 4)]}
+    curve = summ[summ.variant == variant].pivot(index="layer", columns="dataset", values="acc_mean")
+    out["curve"] = {int(l): [round(float(v), 3) for v in row] for l, row in curve.iterrows()}
+    out["curve_columns"] = list(curve.columns)
+    return out
+
+
 def main(argv=None):
     a = parse_args(argv)
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+    unknown = set(stages) - set(ALL_STAGES)
+    if unknown:
+        sys.exit(f"[DỪNG] stage không hợp lệ: {unknown}")
     if a.data == "mix":
         a.size = 16000
     if a.data == "pt" and "train" in stages:
-        sys.exit("[DỪNG] M-PT không fine-tune: dùng --stages infer,contrast,lr")
+        stages = [s for s in stages if s != "train"]          # M-PT không fine-tune
     if a.data != "pt" and (a.size not in SIZE_TAG or a.seed <= 0):
         sys.exit("[DỪNG] cần --size thuộc {25,100,1000,8000,16000} và --seed > 0")
     import torch
@@ -149,18 +192,18 @@ def main(argv=None):
     out = os.path.join(a.out_root, run_id)
     os.makedirs(out, exist_ok=True)
     cfg = load_cfg(a.config, a.set)
-    key = (a.data, a.size if a.data != "pt" else 0, a.seed if a.data != "pt" else 0)
-    is_key = key in KEY_MODELS
+    is_key = is_key_model(a.data, a.size, a.seed)
     keep_ckpt = a.data == "mix" or (a.data == "mnliB" and a.size == 16000)
     save_model = {"auto": keep_ckpt, "yes": True, "no": False}[a.save_model]
     std_reps = {"auto": keep_ckpt or a.data == "pt", "yes": True, "no": False}[a.std_reps]
     fp16 = bool(cfg.get("fp16")) and device.type == "cuda"
-    rec = {"run_id": run_id, "stages": stages, "device": str(device), "gpu_name": gpu,
+    rec = {"run_id": run_id, "stages": stages, "is_key_model": is_key, "device": str(device), "gpu_name": gpu,
            "torch": torch.__version__, "transformers": transformers.__version__, "start_utc": now_utc(),
            "git_commit": git_commit(), "config_sha256": cfg_sha(cfg), "config_file_sha256": sha256_file(a.config),
-           "config_overrides": a.set, "fp16_inference": fp16}
+           "config_overrides": a.set, "fp16_inference": fp16, "degenerate": False, "degenerate_reason": None,
+           "skipped_stages": []}
     log(f"run_id={run_id} | thiết bị={device} {gpu or ''} | torch {torch.__version__} | "
-        f"transformers {transformers.__version__} | stages={stages}")
+        f"transformers {transformers.__version__} | stages={stages} | then chốt={is_key}")
 
     data_dir = L.find_data_dir(a.data_root)
     rec["data_dir"] = data_dir
@@ -174,8 +217,16 @@ def main(argv=None):
 
     model = tok = None
     n_layers = None
+    metrics = {}
+
+    def degenerate(reason):
+        rec["degenerate"], rec["degenerate_reason"] = True, reason
+        later = [s for s in stages if ALL_STAGES.index(s) > ALL_STAGES.index(current)]
+        rec["skipped_stages"] = later
+        log(f"[THOÁI HOÁ] {reason} -> bỏ các stage {later}; giữ bản ghi (SPEC §3.3), hàng đợi sẽ chạy seed+100")
 
     # ------------------------------------------------------------ train
+    current = "train"
     if "train" in stages:
         from khoaluan.train.finetune import finetune
         frame = L.train_frame(data_dir, a.data, a.size)
@@ -191,7 +242,11 @@ def main(argv=None):
         with open(os.path.join(out, "train_log.json"), "w") as f:
             json.dump({"loss_every_logging_steps": st["train_loss_curve"],
                        "logging_steps": cfg.get("logging_steps")}, f)
-        log(f"fine-tune xong: {st['wall_minutes_train']} phút, loss TB {st['train_loss_mean']:.4f}")
+        log(f"fine-tune xong: {st['wall_minutes_train']} phút, loss TB {st['train_loss_mean']:.4f}, "
+            f"dừng sớm={st['aborted']}")
+        if st["aborted"]:
+            degenerate(f"loss TB nửa sau epoch 1 = {st['abort_rule']['epoch1_second_half_mean_loss']:.4f} "
+                       f"≥ {st['abort_rule']['threshold']}")
     elif {"infer", "contrast"} & set(stages):
         from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
         if a.data == "pt":
@@ -208,8 +263,8 @@ def main(argv=None):
         n_layers = model.config.num_hidden_layers
 
     # ------------------------------------------------------------ infer
-    metrics = {}
-    if "infer" in stages:
+    current = "infer"
+    if "infer" in stages and not rec["degenerate"]:
         from khoaluan.eval.forward import run_pairs
         sets = ["dev_m", "dev_mm", "hans_eval"] + (["hans_train_B"] if std_reps else [])
         std_layers = parse_layers(a.std_layers, n_layers) if std_reps else []
@@ -236,17 +291,20 @@ def main(argv=None):
             kind = "mix" if a.data == "mix" else "mnli"
             q4 = M.q4_check(metrics, kind)
             metrics["Q4"] = {k: [None if v[0] is None else round(float(v[0]), 4), bool(v[1])] for k, v in q4.items()}
-            metrics["degenerate"] = M.is_degenerate(a.size, metrics["devm_acc"])
             log(f"Q4 ({kind}, ngưỡng tiền đăng ký): {metrics['Q4']}")
             if a.size < 16000 and a.data == "mnliB":
                 log("(Q4 chỉ áp dụng cho M-16K / M-MIX; với kích thước khác chỉ để tham khảo)")
+            if M.is_degenerate(a.size, metrics["devm_acc"]):
+                degenerate(f"DEV-M acc = {metrics['devm_acc']:.4f} < 0.60")
+    metrics["degenerate"] = rec["degenerate"]
 
     # ------------------------------------------------------------ contrast
-    if "contrast" in stages:
+    current = "contrast"
+    if "contrast" in stages and not rec["degenerate"]:
         from khoaluan.eval.forward import run_contrast
         cp_spec = a.cp_layers if a.cp_layers != "auto" else ("all" if is_key else "20-24")
         cls_layers = parse_layers(cp_spec, n_layers)
-        aux_layers = parse_layers("20-24", n_layers) if is_key else []
+        aux_layers = parse_layers(a.aux_layers, n_layers) if is_key else []
         if not cls_layers:
             sys.exit(f"[DỪNG] không có tầng nào để trích (cp-layers={cp_spec}, model có {n_layers} tầng)")
         # Trích contrast ở fp32 trừ khi --set fp16_contrast=true: hiệu h(Yes) − h(No) nhạy với sai số số học.
@@ -285,24 +343,25 @@ def main(argv=None):
             json.dump(cp_meta, f, indent=2)
         rec["wall_minutes_contrast"] = round((time.time() - t) / 60, 2)
 
-    # ------------------------------------------------------------ lr
-    lr_report = {}
-    if "lr" in stages:
-        from khoaluan.probe import lr as P
-        cdir = a.cache_dir or out
+    # ------------------------------------------------------------ lr / ccs / dr1 (CPU/GPU nhỏ, từ cache)
+    cdir = a.cache_dir or out
+    ref_key = "pt" if a.data == "pt" else ("mix" if a.data == "mix" else SIZE_TAG[a.size])
+    lr_report, ccs_report, dr1_report = {}, {}, {}
+    probe_stages = [s for s in ("lr", "ccs", "dr1") if s in stages]
+    if probe_stages and not rec["degenerate"]:
         with open(os.path.join(cdir, "cp_layers.json")) as f:
             cpm = json.load(f)
         layer_ids = cpm["cls_layers"]
+
+    current = "lr"
+    if "lr" in stages and not rec["degenerate"]:
+        from khoaluan.probe import lr as P
         layers = layer_ids if a.lr_layers == "all" else [l for l in parse_layers(a.lr_layers, max(layer_ids))
                                                          if l in layer_ids]
         t = time.time()
         res = []
         for s in ("dev_m", "hans_eval"):
-            meta = pd.read_parquet(os.path.join(cdir, f"cp_{s}_meta.parquet"))
-            hy = np.load(os.path.join(cdir, f"cp_{s}_cls_yes.npy"), mmap_mode="r")
-            hn = np.load(os.path.join(cdir, f"cp_{s}_cls_no.npy"), mmap_mode="r")
-            y = meta.y.to_numpy()
-            splits = P.splits_mnli(y) if s == "dev_m" else P.splits_hans(meta.heuristic + "|" + meta.y.astype(str))
+            meta, hy, hn, y, splits = load_cp(cdir, s)
             res.append(P.run_lr(hy, hn, y, splits, layers, layer_ids, dataset=s, log=log))
             if s == "dev_m" and cpm["dtype"] == "float32":
                 P.fp16_storage_diagnostic(hy, hn, layer_ids).to_csv(os.path.join(out, "cp_fp16_diag.csv"), index=False)
@@ -312,29 +371,85 @@ def main(argv=None):
         summ = P.summarize(raw)
         summ.insert(0, "run_id", run_id)
         summ.to_csv(os.path.join(out, "lr_summary.csv"), index=False)
+        if cpm.get("aux_layers"):                       # D-R4: token cuối / mean pooling (so Bảng 1 của V&dL)
+            aux = []
+            for s in ("dev_m", "hans_eval"):
+                _meta, _hy, _hn, y, splits = load_cp(cdir, s)
+                for kind in ("last", "mean"):
+                    ay = np.load(os.path.join(cdir, f"cp_{s}_{kind}_yes.npy"), mmap_mode="r")
+                    an = np.load(os.path.join(cdir, f"cp_{s}_{kind}_no.npy"), mmap_mode="r")
+                    d = P.run_lr(ay, an, y, splits, cpm["aux_layers"], cpm["aux_layers"], variants=("faithful",),
+                                 dataset=s)
+                    d["token"] = kind
+                    aux.append(d)
+            aux = pd.concat(aux, ignore_index=True)
+            aux.insert(0, "run_id", run_id)
+            (aux.groupby(["run_id", "token", "dataset", "layer", "variant"])
+                .agg(acc_mean=("acc", "mean"), acc_sd=("acc", "std"), n_runs=("acc", "size")).reset_index()
+                .to_csv(os.path.join(out, "lr_aux_summary.csv"), index=False))
         rec["wall_minutes_lr"] = round((time.time() - t) / 60, 2)
-        ref_key = "pt" if a.data == "pt" else ("mix" if a.data == "mix" else SIZE_TAG[a.size])
-        for l in [x for x in (23, 24) if x in layers]:
-            f = summ[(summ.layer == l) & (summ.variant == "faithful")].set_index("dataset")
-            r = summ[(summ.layer == l) & (summ.variant == "robust")].set_index("dataset")
-            lr_report[f"L{l}"] = {
-                "faithful_MNLI": round(float(f.loc["dev_m", "acc_mean"]), 4),
-                "faithful_HANS": round(float(f.loc["hans_eval", "acc_mean"]), 4),
-                "faithful_SD_MNLI_HANS": [round(float(f.loc["dev_m", "acc_sd"]), 4),
-                                          round(float(f.loc["hans_eval", "acc_sd"]), 4)],
-                "robust_MNLI": round(float(r.loc["dev_m", "acc_mean"]), 4),
-                "robust_HANS": round(float(r.loc["hans_eval", "acc_mean"]), 4),
-                "conv_warn_faithful": int(f.conv_warn.sum()),
-            }
-        lr_report["ref_VdL_L23_MNLI_HANS"] = REF_LR23[ref_key]
-        curve = summ[summ.variant == "faithful"].pivot(index="layer", columns="dataset", values="acc_mean")
-        lr_report["faithful_curve"] = {int(l): [round(float(v), 3) for v in row] for l, row in curve.iterrows()}
-        lr_report["curve_columns"] = list(curve.columns)
+        lr_report = {"faithful": layer_report(summ, "faithful", layers),
+                     "robust": {k: v for k, v in layer_report(summ, "robust", layers).items() if k.startswith("L")},
+                     "conv_warn_faithful_total": int(summ[summ.variant == "faithful"].conv_warn.sum()),
+                     "ref_VdL_L23_MNLI_HANS": REF_LR23[ref_key]}
+
+    current = "ccs"
+    if "ccs" in stages and not rec["degenerate"]:
+        from khoaluan.probe import ccs as C
+        t = time.time()
+        res = []
+        mlp_layers = [l for l in (23, 24) if l in layer_ids]
+        for s in ("dev_m", "hans_eval"):
+            meta, hy, hn, y, splits = load_cp(cdir, s)
+            res.append(C.run_ccs(hy, hn, y, splits, layer_ids, layer_ids, mlp_layers=mlp_layers, dataset=s, log=log))
+        if cpm.get("aux_layers"):                       # D-R4: CCS tuyến tính trên token cuối / mean pooling
+            aux = []
+            for s in ("dev_m", "hans_eval"):
+                _meta, _hy, _hn, y, splits = load_cp(cdir, s)
+                for kind in ("last", "mean"):
+                    ay = np.load(os.path.join(cdir, f"cp_{s}_{kind}_yes.npy"), mmap_mode="r")
+                    an = np.load(os.path.join(cdir, f"cp_{s}_{kind}_no.npy"), mmap_mode="r")
+                    d = C.run_ccs(ay, an, y, splits, cpm["aux_layers"], cpm["aux_layers"], dataset=s)
+                    d["token"] = kind
+                    aux.append(d)
+            aux = pd.concat(aux, ignore_index=True)
+            aux.insert(0, "run_id", run_id)
+            (aux.groupby(["run_id", "token", "dataset", "layer", "variant"])
+                .agg(acc_mean=("acc", "mean"), acc_sd=("acc", "std"), n_runs=("acc", "size")).reset_index()
+                .to_csv(os.path.join(out, "ccs_aux_summary.csv"), index=False))
+        raw = pd.concat(res, ignore_index=True)
+        raw.insert(0, "run_id", run_id)
+        raw.to_csv(os.path.join(out, "ccs_raw.csv"), index=False)
+        summ = (raw.groupby(["run_id", "dataset", "layer", "variant"])
+                   .agg(acc_mean=("acc", "mean"), acc_sd=("acc", "std"), n_runs=("acc", "size")).reset_index())
+        summ.to_csv(os.path.join(out, "ccs_summary.csv"), index=False)
+        rec["wall_minutes_ccs"] = round((time.time() - t) / 60, 2)
+        ccs_report = {"linear": layer_report(summ, "linear", layer_ids),
+                      "mlp": {k: v for k, v in layer_report(summ, "mlp", layer_ids).items() if k.startswith("L")},
+                      "chance_note": "acc = max(acc, 1-acc): mức chance ≈ 0.513, phân vị 95% ≈ 0.531 với 1,000 ví dụ test"}
+
+    current = "dr1"
+    if "dr1" in stages and not rec["degenerate"]:
+        from khoaluan.probe import lr as P
+        layers = [l for l in parse_layers(a.dr1_layers, max(layer_ids)) if l in layer_ids]
+        if layers:
+            t = time.time()
+            meta, hy, hn, _y, _ = load_cp(cdir, "hans_eval")
+            raw = P.run_dr1(hy, hn, meta, layers, layer_ids, robust_layers=[l for l in (23, 24) if l in layers],
+                            log=log)
+            raw.insert(0, "run_id", run_id)
+            raw.to_csv(os.path.join(out, "dr1_raw.csv"), index=False)
+            summ = raw.groupby(["run_id", "layer", "split", "variant"]).acc.agg(["mean", "std"]).reset_index()
+            summ.to_csv(os.path.join(out, "dr1_summary.csv"), index=False)
+            rec["wall_minutes_dr1"] = round((time.time() - t) / 60, 2)
+            f = summ[summ.variant == "faithful"]
+            dr1_report = {f"L{int(l)}": {r["split"]: round(float(r["mean"]), 4) for _, r in g.iterrows()}
+                          for l, g in f.groupby("layer")}
 
     # ------------------------------------------------------------ ghi kết quả
     rec["wall_minutes_total"] = round((time.time() - T0) / 60, 2)
     rec["metrics"] = metrics
-    rec["lr"] = lr_report
+    rec["lr"], rec["ccs"], rec["dr1"] = lr_report, ccs_report, dr1_report
     with open(os.path.join(out, "p2_metrics.json"), "w") as f:
         json.dump(rec, f, indent=2, ensure_ascii=False, default=str)
     if {"train", "infer"} & set(stages):
@@ -350,30 +465,34 @@ def main(argv=None):
             hans_E_LO=metrics.get("hans_E_LO"), hans_E_SUB=metrics.get("hans_E_SUB"),
             hans_E_CON=metrics.get("hans_E_CON"), hans_NE_LO=metrics.get("hans_NE_LO"),
             hans_NE_SUB=metrics.get("hans_NE_SUB"), hans_NE_CON=metrics.get("hans_NE_CON"),
-            truncation_rate=tr.get("truncation_rate"), degenerate=metrics.get("degenerate"),
-            notes=("UNOFFICIAL-DATA (test) " if a.allow_unofficial_data else "") + f"stages={','.join(stages)}",
+            truncation_rate=tr.get("truncation_rate"), degenerate=rec["degenerate"],
+            notes=("UNOFFICIAL-DATA (test) " if a.allow_unofficial_data else "") + f"stages={','.join(stages)}"
+                  + (f"; THOÁI HOÁ: {rec['degenerate_reason']}" if rec["degenerate"] else ""),
             train_loss_mean=tr.get("train_loss_mean"), steps=tr.get("steps"), optim=tr.get("optim"),
-            fp16_train=tr.get("fp16"), Q4=metrics.get("Q4"), hans_acc_total=metrics.get("hans_acc_total"),
+            fp16_train=tr.get("fp16"), aborted=tr.get("aborted"), Q4=metrics.get("Q4"),
+            hans_acc_total=metrics.get("hans_acc_total"),
         )
     write_summary(rec, os.path.join(out, "p2_summary.txt"))
-    log(f"XONG {run_id}. Gửi lại nội dung {os.path.join(out, 'p2_summary.txt')}")
+    log(f"XONG {run_id}. Tóm tắt: {os.path.join(out, 'p2_summary.txt')}")
     return rec
 
 
 def write_summary(rec, path):
     m = rec.get("metrics", {})
     blocks = {
-        "run": {k: rec.get(k) for k in ["run_id", "stages", "git_commit", "gpu_name", "torch", "transformers",
-                                         "fp16_inference", "data_manifest_sha256"]},
+        "run": {k: rec.get(k) for k in ["run_id", "stages", "is_key_model", "git_commit", "gpu_name", "torch",
+                                         "transformers", "fp16_inference", "data_manifest_sha256"]},
         "data_check_ok": (rec.get("data_check") or {}).get("ok") if isinstance(rec.get("data_check"), dict)
         else rec.get("data_check"),
+        "degenerate": {"degenerate": rec.get("degenerate"), "reason": rec.get("degenerate_reason"),
+                       "skipped_stages": rec.get("skipped_stages")},
         "train": rec.get("train"),
         "wall_minutes": {k: rec.get(k) for k in ["wall_minutes_infer", "wall_minutes_contrast", "wall_minutes_lr",
-                                                  "wall_minutes_total"]},
+                                                  "wall_minutes_ccs", "wall_minutes_dr1", "wall_minutes_total"]},
         "behaviour": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()
                       if k not in ("Q4", "degenerate")},
-        "Q4": m.get("Q4"), "degenerate": m.get("degenerate"),
-        "lr": rec.get("lr"),
+        "Q4": m.get("Q4"),
+        "lr": rec.get("lr"), "ccs": rec.get("ccs"), "dr1": rec.get("dr1"),
     }
     with open(path, "w") as f:
         for k, v in blocks.items():

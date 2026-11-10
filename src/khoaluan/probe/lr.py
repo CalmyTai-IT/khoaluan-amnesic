@@ -105,3 +105,47 @@ def fp16_storage_diagnostic(h_yes, h_no, layer_ids):
         rel_err = float(np.median(np.linalg.norm(d16 - d, axis=1)[ok] / nd[ok])) if ok.any() else float("nan")
         rows.append({"layer": l, "rel_diff": rel_diff, "rel_err16": rel_err, "frac_zero_diff": float(1 - ok.mean())})
     return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------ D-R1 (SPEC_REPRODUCE §8)
+def dr1_folds(meta, n_folds=5):
+    """Chẩn đoán D-R1: mỗi subcase HANS có nhãn cố định -> LR-HANS có thể chỉ nhận diện template.
+    Fold k giữ lại subcase thứ k (theo tên) của mỗi (heuristic × nhãn) -> 6 subcase held-out, train trên 24 subcase còn lại.
+    Trả về list (train_idx, test_idx, held_out_subcases)."""
+    folds = []
+    for k in range(n_folds):
+        held = []
+        for h in sorted(meta.heuristic.unique()):
+            for y in (0, 1):
+                scs = sorted(meta.loc[(meta.heuristic == h) & (meta.y == y), "subcase"].unique())
+                if len(scs) != n_folds:
+                    raise ValueError(f"D-R1 cần đúng {n_folds} subcase cho mỗi heuristic×nhãn, {h}|{y} có {len(scs)}")
+                held.append(scs[k])
+        mask = meta.subcase.isin(held).to_numpy()
+        folds.append((np.where(~mask)[0], np.where(mask)[0], held))
+    return folds
+
+
+def run_dr1(h_yes, h_no, meta, layers, layer_ids, robust_layers=(), log=None):
+    """So LR khi test là subcase CHƯA THẤY (held-out) với LR chia ngẫu nhiên CÙNG kích thước train/test,
+    phân tầng theo heuristic × nhãn. Tụt mạnh về ~0.5 ở held-out -> LR-HANS chủ yếu phản ánh template."""
+    pos = {l: i for i, l in enumerate(layer_ids)}
+    y = meta.y.to_numpy()
+    strata = (meta.heuristic + "|" + meta.y.astype(str)).to_numpy()
+    idx = np.arange(len(meta))
+    rows = []
+    for l in layers:
+        x = dlk_x(np.asarray(h_yes[:, pos[l]], dtype=np.float32), np.asarray(h_no[:, pos[l]], dtype=np.float32))
+        variants = ["faithful"] + (["robust"] if l in robust_layers else [])
+        for k, (tr, te, _held) in enumerate(dr1_folds(meta)):
+            rtr, rte = train_test_split(idx, test_size=len(te), stratify=strata, random_state=k)
+            for split, (a, b) in (("subcase_heldout", (tr, te)), ("random_matched", (rtr, rte))):
+                for v in variants:
+                    acc, nw = fit_eval(x[a], y[a], x[b], y[b], v)
+                    rows.append({"layer": l, "fold": k, "split": split, "variant": v, "acc": acc, "n_conv_warn": nw})
+        if log:
+            d = pd.DataFrame([r for r in rows if r["layer"] == l and r["variant"] == "faithful"])
+            m = d.groupby("split").acc.mean()
+            log(f"  D-R1 tầng {l:2d}: held-out {m.get('subcase_heldout', float('nan')):.3f} | "
+                f"ngẫu nhiên {m.get('random_matched', float('nan')):.3f}")
+    return pd.DataFrame(rows)

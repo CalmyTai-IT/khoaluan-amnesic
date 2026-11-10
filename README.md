@@ -16,14 +16,18 @@ scripts/merge_registry.py       # gộp run_record.json -> results/registry.csv
 notebooks/kaggle_template.ipynb # notebook mẫu Kaggle (A-09); bản .py cùng nội dung để review diff
 results/registry.csv            # registry kết quả — nguồn duy nhất cho số liệu trong luận văn
 src/khoaluan/data/load.py       # P2: đọc đầu ra prepare_data v1.2 + kiểm vân tay lần A-06 chính thức
-src/khoaluan/train/finetune.py  # P2/S2: fine-tune (HF Trainer v5; chốt chặn 1 GPU, batch 8, số bước)
+src/khoaluan/train/finetune.py  # P2/S2: fine-tune 5 epoch cố định (HF Trainer v5; chốt 1 GPU, batch 8, số bước); dừng sớm run thoái hoá
 src/khoaluan/eval/{forward,metrics}.py  # P2: inference (logits theo uid, pooler = L_out), contrast pair, chỉ số HANS, Q4
-src/khoaluan/probe/lr.py        # P2/S3: LR faithful (DLK) + robust; chẩn đoán lưu fp16
-src/khoaluan/p2.py              # điều phối một mô hình: train -> infer -> contrast -> lr
-scripts/run_p2.py               # CUDA_VISIBLE_DEVICES=0 python scripts/run_p2.py --data mnliB --size 16000 --seed 11 ...
-notebooks/kaggle_p2.ipynb       # notebook P2 (bản .py cùng nội dung)
+src/khoaluan/probe/lr.py        # P2/S3: LR faithful (DLK) + robust; D-R1; chẩn đoán lưu fp16
+src/khoaluan/probe/ccs.py       # P2/S3: CCS theo DLK (10 lần thử huấn luyện đồng thời)
+src/khoaluan/p2.py              # một mô hình: train -> infer -> contrast -> lr -> ccs -> dr1
+src/khoaluan/p2_queue.py        # hàng đợi một GPU; tự chạy lại seed+100, +200 khi thoái hoá (SPEC §3.3)
+src/khoaluan/analysis/p2_report.py  # gộp kết quả + G2 theo quy tắc viết TRƯỚC khi có kết quả; D-R2, D-R3
+configs/p2/plan.yaml            # phiên S1–S4 (21 mô hình = 20 fine-tune + M-PT)
+scripts/run_p2.py | run_queue.py | analyze_p2.py
+notebooks/kaggle_p2.ipynb       # notebook P2: chọn SESSION, 2 hàng đợi song song (bản .py cùng nội dung)
 tests/                          # python -m pytest -q tests/   (test_p2.py: BERT 2 tầng, CPU, offline)
-# Chưa viết: CCS, D-R1, D-R2 (CPU từ cache, sau pilot); P3–P4: src/khoaluan/erase/, src/khoaluan/stats/
+# Chưa viết: P3–P4: src/khoaluan/erase/, src/khoaluan/stats/
 ```
 
 ## Quy tắc
