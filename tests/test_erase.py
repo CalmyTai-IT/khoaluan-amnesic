@@ -74,6 +74,9 @@ def test_stratified_permutation_and_holm():
         assert sorted(p[s == g]) == sorted(z[s == g])
     assert not np.array_equal(p, z)
     assert np.allclose(holm([0.01, 0.04, 0.03]), [0.03, 0.06, 0.06])
+    from khoaluan.erase.pilot import bh, p_one_sided
+    assert np.allclose(bh([0.01, 0.04, 0.03, 0.2]), [0.04, 0.16 / 3, 0.16 / 3, 0.2])
+    assert p_one_sided(np.arange(99) / 100, -1) == 0.01 and p_one_sided(np.zeros(9), 0.0) == 1.0
 
 
 def test_hans_metrics_matches_eval_metrics():
@@ -106,22 +109,57 @@ def _synthetic_pool(n=20000, seed=0):
 
 def test_mnli_sets_balance_matching_disjoint_deterministic():
     pool = _synthetic_pool()
-    a, rep = SETS.build_mnli_sets(pool, np.random.default_rng(7), n_label=2000)
-    b, _ = SETS.build_mnli_sets(pool, np.random.default_rng(7), n_label=2000)
+    kw = dict(seed=7, n_label=2000, n_label_big=4000, n_resample=3)
+    a, rep = SETS.build_mnli_sets(pool, **kw)
+    b, _ = SETS.build_mnli_sets(pool, **kw)
     assert a["c_LO"].uid.tolist() == b["c_LO"].uid.tolist()                    # tất định
+    assert a["c_LO_resamples"].uid.tolist() == b["c_LO_resamples"].uid.tolist()
     lo = a["c_LO"]
     n_star = rep["n_star_LO+C_fit"]
-    cnt = lo.groupby(["z", "y"]).size()
-    assert cnt.loc[(1, 1)] == cnt.loc[(1, 0)] == cnt.loc[(0, 1)] == cnt.loc[(0, 0)] == n_star   # 2×2 cân bằng
-    assert set(lo.uid).isdisjoint(a["MNLI_HC"].uid) and set(lo.uid).isdisjoint(a["c_LABEL"].uid)
-    assert set(a["MNLI_HC"].uid).isdisjoint(a["c_LABEL"].uid)
+
+    def balanced(df):
+        cnt = df.groupby(["z", "y"]).size()
+        return cnt.loc[(1, 1)] == cnt.loc[(1, 0)] == cnt.loc[(0, 1)] == cnt.loc[(0, 0)] == n_star   # 2×2 cân bằng
+    assert balanced(lo)
+    rs = a["c_LO_resamples"]
+    assert sorted(rs["resample"].unique()) == [1, 2] and all(balanced(g) for _, g in rs.groupby("resample"))
+    r1 = rs[rs["resample"] == 1]
+    assert set(r1.uid[r1.z == 0]) != set(lo.uid[lo.z == 0])   # mẫu khác nhau
+    lab, big = a["c_LABEL"], a["c_LABEL_40K"]
+    for other in (lo, rs, a["MNLI_HC"]):
+        assert set(other.uid).isdisjoint(big.uid)
+    assert set(lo.uid).isdisjoint(a["MNLI_HC"].uid) and set(rs.uid).isdisjoint(a["MNLI_HC"].uid)
     # ghép đúng neg_pattern trong từng nhãn -> SMD của neg_p, neg_h = 0 (trước ghép: confound mạnh ở ô C)
     for y in ("E", "C"):
         assert abs(rep["SMD_c_LO_within_label"][f"y={y}|neg_p"]) < 1e-9
         assert abs(rep["SMD_c_LO_within_label"][f"y={y}|neg_h"]) < 1e-9
+    assert rep["SMD_max_abs"] < 0.1 and rep["SMD_max_abs_before"] > rep["SMD_max_abs"]
     assert abs((lo.split == "held").mean() - 0.25) < 0.03
-    lab = a["c_LABEL"]
     assert (lab.y == 0).sum() == (lab.y == 1).sum() == 1000 and (lab.z == lab.y).all()
+    assert (big.y == 0).sum() == (big.y == 1).sum() == 2000
+    assert set(lab.uid) <= set(big.uid)                                          # c_LABEL lồng trong c_LABEL_40K, cùng split
+    assert (big.set_index("uid").loc[lab.uid, "split"].to_numpy() == lab.split.to_numpy()).all()
+    # mẫu chính và MNLI-HC không phụ thuộc số lần lấy mẫu lặp
+    c, _ = SETS.build_mnli_sets(pool, seed=7, n_label=2000, n_label_big=4000, n_resample=1)
+    assert c["c_LO"].uid.tolist() == lo.uid.tolist() and c["MNLI_HC"].uid.tolist() == a["MNLI_HC"].uid.tolist()
+    with pytest.raises(TypeError):
+        SETS.build_mnli_sets(pool, np.random.default_rng(7))
+
+
+def test_nn_matching_fixes_length_confound():
+    """prem_len lệch theo LO (như MNLI thật: LO+ có premise dài hơn) -> ghép ngẫu nhiên trong tầng để lại |SMD| lớn;
+    ghép láng giềng gần nhất trong tầng phải đưa |SMD| < 0.1 mà vẫn giữ đúng số lượng mỗi tầng."""
+    pool = _synthetic_pool(40000, seed=3)
+    rng = np.random.default_rng(0)
+    pool["prem_len"] = pool.prem_len + np.where(pool.lo == 1, 4, 0) + rng.integers(0, 3, len(pool))
+    kw = dict(seed=7, n_label=1000, n_label_big=1000, n_resample=1)
+    _, rep_rand = SETS.build_mnli_sets(pool, nn_vars=None, **kw)
+    sets_nn, rep_nn = SETS.build_mnli_sets(pool, **kw)
+    assert rep_rand["SMD_max_abs"] > 0.2 and rep_nn["SMD_max_abs"] < 0.1
+    lo = sets_nn["c_LO"]
+    k = SETS._key(lo, SETS.MATCH_LEVELS[0])
+    for (y, s), g in lo.assign(k=k).groupby(["y", "k"]):
+        assert (g.z == 1).sum() == (g.z == 0).sum()                         # số lượng mỗi tầng khớp chính xác (level 0)
 
 
 def _hans_frame(source, per_subcase, start, seed):
@@ -179,13 +217,13 @@ def env(tmp_path_factory):
     return {"tiny": tiny, "data": dd}
 
 
-def test_pilot_detects_planted_effect_and_controls(env, tmp_path):
-    """Biểu diễn tổng hợp (d = 16): head dùng hướng e1 = 'liên tiếp' (SUB/CON) để đẩy về E bất kể nhãn; e2 mã hoá nhãn
-    thật; e3 = số chủ ngữ (không vào head). Kỳ vọng: c_SUB/c_JOINT làm RG cột SUB, CON giảm mạnh, p nhỏ; c_CTRL_H và
-    cột LO không có ý nghĩa; c_LABEL đưa DEV-M về chance."""
+def _planted_run(env, tmp_path, readout):
+    """Biểu diễn tổng hợp (d = 16): hướng e1 = 'liên tiếp' (SUB/CON) đẩy về E bất kể nhãn; e2 mã hoá nhãn thật;
+    e3 = số chủ ngữ (không vào head). readout=False: cache pooler = X, head tuyến tính trên X (kiểm L_out).
+    readout=True: cache [CLS]_24 = X, pooler = tanh(I·X), head trên tanh(X) (kiểm L_ℓ tại ℓ = L qua pooler phi tuyến)."""
     from safetensors.torch import save_file
     from khoaluan.data import load as Ld
-    from khoaluan.erase.pilot import main
+    from khoaluan.erase.pilot import _uid_hash
     rng = np.random.default_rng(11)
     d = 16
     dd = env["data"]
@@ -194,12 +232,18 @@ def test_pilot_detects_planted_effect_and_controls(env, tmp_path):
     rdir = os.path.join(runs, rid)
     os.makedirs(os.path.join(rdir, "model"))
     W = np.zeros((2, d))
-    W[0, 0], W[0, 1] = 1.5, 1.0                       # logit_E = 1.5·e1 + 1.0·e2 ; logit_NE = 0
-    save_file({"classifier.weight": torch.tensor(W, dtype=torch.float32),
-               "classifier.bias": torch.zeros(2, dtype=torch.float32)}, os.path.join(rdir, "model", "model.safetensors"))
+    W[0, 0], W[0, 1] = 1.5, 1.0                       # logit_E = 1.5·e1 + 1.0·e2 ; logit_NE = 0  (trên pooler)
+    tens = {"classifier.weight": torch.tensor(W, dtype=torch.float32), "classifier.bias": torch.zeros(2)}
+    if readout:
+        tens["bert.pooler.dense.weight"] = torch.eye(d)
+        tens["bert.pooler.dense.bias"] = torch.zeros(d)
+    save_file(tens, os.path.join(rdir, "model", "model.safetensors"))
+    json.dump({"num_hidden_layers": 24, "hidden_size": d}, open(os.path.join(rdir, "model", "config.json"), "w"))
+    json.dump({"cls_layers": [24]}, open(os.path.join(rdir, "std_layers.json"), "w"))
+    pool_fn = np.tanh if readout else (lambda x: x)
 
-    def reps(frame, contiguous, label_sign, subj=None):
-        X = rng.normal(scale=0.3, size=(len(frame), d))
+    def reps(n, contiguous, label_sign, subj=None):
+        X = rng.normal(scale=0.3, size=(n, d))
         X[:, 0] += np.where(contiguous, 3.0, -3.0)
         X[:, 1] += label_sign
         if subj is not None:
@@ -209,40 +253,185 @@ def test_pilot_detects_planted_effect_and_controls(env, tmp_path):
     for s in ("hans_eval", "hans_train_B", "dev_m"):
         fr = Ld.eval_frame(dd, s)
         if s == "dev_m":
-            X = reps(fr, np.zeros(len(fr), bool), np.where(fr.y == 0, 3.0, -3.0))
+            X = reps(len(fr), np.zeros(len(fr), bool), np.where(fr.y == 0, 3.0, -3.0))
             X[:, 0] = rng.normal(scale=0.3, size=len(fr))            # MNLI: không có tín hiệu e1
         else:
             raw = pd.read_json(os.path.join(dd, f"{s}.jsonl"), lines=True).set_index("uid").loc[fr.uid]
-            X = reps(fr, fr.heuristic.isin(["subsequence", "constituent"]).to_numpy(),
+            X = reps(len(fr), fr.heuristic.isin(["subsequence", "constituent"]).to_numpy(),
                      np.where(fr.y == 0, 1.0, -1.0), raw.subj_num.to_numpy())
-        lg = X @ W.T
-        np.save(os.path.join(rdir, f"std_{s}_pooler.npy"), X.astype(np.float16))
+        P = pool_fn(X)
+        lg = P @ W.T
+        np.save(os.path.join(rdir, f"std_{s}_pooler.npy"), P.astype(np.float16))
+        np.save(os.path.join(rdir, f"std_{s}_cls.npy"), X[:, None, :].astype(np.float16))
         with open(os.path.join(rdir, f"std_{s}_uids.txt"), "w") as f:
             f.write("\n".join(fr.uid))
         pd.DataFrame({"uid": fr.uid, "pred": (lg[:, 1] > lg[:, 0]).astype(int)}).to_parquet(
             os.path.join(rdir, f"preds_{s}.parquet"))
-    sets, union, _ = SETS.build_all(dd, n_label=400)
+    sets, union, _ = SETS.build_all(dd, n_label=400, n_label_big=800, n_resample=3)
     Xp = rng.normal(scale=0.3, size=(len(union), d))
     Xp[:, 1] += np.where(union.y == 0, 3.0, -3.0)
-    os.makedirs(os.path.join(out, rid))
-    np.save(os.path.join(out, rid, "pool_pooler.npy"), Xp.astype(np.float16))
-    models, cells = main(["--data-root", dd, "--runs-root", runs, "--out", out, "--run-ids", rid, "--n-null", "200",
-                          "--n-label", "400", "--allow-unofficial-data"])
+    od = os.path.join(out, rid)
+    os.makedirs(od)
+    np.save(os.path.join(od, "pool_pooler.npy"), pool_fn(Xp).astype(np.float16))
+    np.save(os.path.join(od, "pool_logits.npy"), pool_fn(Xp) @ W.T)
+    np.save(os.path.join(od, "pool_cls.npy"), Xp[:, None, :].astype(np.float16))
+    json.dump({"n": len(union), "uid_sha": _uid_hash(union.uid.tolist()), "cls_layers": [24]},
+              open(os.path.join(od, "pool_meta.json"), "w"))
+    args = ["--data-root", dd, "--runs-root", runs, "--out", out, "--run-ids", rid, "--n-label", "400",
+            "--n-label-big", "800", "--n-resample", "3", "--cls-layers", "24", "--allow-unofficial-data"]
+    return out, rid, args
+
+
+def test_pilot_detects_planted_effect_and_controls(env, tmp_path):
+    """L_out. Kỳ vọng: c_SUB/c_JOINT làm RG cột SUB, CON giảm mạnh, p nhỏ; c_CTRL_H và cột LO không có ý nghĩa;
+    c_LABEL đưa DEV-M về chance; c_LO (không mang tín hiệu nào trong biểu diễn) ổn định ≈ 0."""
+    from khoaluan.erase.pilot import main
+    out, rid, args = _planted_run(env, tmp_path, readout=False)
+    models, cells = main(args + ["--n-null", "200", "--stages", "lout"])
     m = models[0]["concepts"]
-    assert models[0]["concepts"]["c_LABEL"]["positive_control_ok"]
+    assert m["c_LABEL"]["positive_control_ok"] and m["c_LABEL_40K"]["positive_control_ok"]
     c = cells.set_index(["concept", "column"])
     for col in ("SUB", "CON"):
         assert c.loc[("c_SUB", col), "dRG"] < -0.5 and c.loc[("c_SUB", col), "p_N3"] < 0.01
         assert c.loc[("c_SUB", col), "dRG"] < c.loc[("c_SUB", col), "q05_N1"]
         assert c.loc[("c_SUB", col), "cell_robust_this_seed"]
+        assert c.loc[("c_SUB", col), "dPE_NE"] < -0.3 and c.loc[("c_SUB", col), "p_N3_PE_NE"] < 0.01
+        assert c.loc[("c_SUB", col), "flip_NE"] > 0.5 and c.loc[("c_SUB", col), "dMargin_NE"] < 0
         # c_JOINT (3 lớp, 2 lớp cùng mang e1): LEACE affine kéo về trung bình tập fit (e1 = +1) -> hiệu ứng yếu hơn
         assert c.loc[("c_JOINT", col), "dRG"] < 0
     for col in ("LO", "SUB", "CON"):
         assert c.loc[("c_CTRL_H", col), "p_N3"] > 0.05 and abs(c.loc[("c_CTRL_H", col), "dRG"]) < 0.05
     assert m["c_SUB"]["decode_balacc_held"] > 0.95 and m["c_SUB"]["probe_after_balacc_held"] < 0.6
-    assert m["c_SUB"]["logit_gap_between_classes_after_fit"] < 1e-6
+    assert m["c_SUB"]["logit_gap_between_classes_after_fit"] < 1e-6 and m["c_SUB"]["mean_shift_rel"] > 0
+    st = models[0]["c_LO_stability"]
+    assert st["n_samples"] == 3 and len(st["per_sample"]) == 3 and abs(st["mean_over_samples"]["dRG_SUB"]) < 0.05
     text = open(os.path.join(out, "erase_summary.md")).read()
-    assert "Ma trận cross-effect" in text and "ĐẠT" in text
+    assert "Ma trận cross-effect" in text and "ĐẠT" in text and "Độ ổn định hướng c_LO" in text
+
+
+def test_layers_planted_effect_at_last_layer_via_pooler(env, tmp_path):
+    """L_ℓ tại ℓ = L (xoá trước pooler tanh): hiệu ứng cài sẵn phải được phát hiện qua pooler phi tuyến, null đủ, BH."""
+    from khoaluan.erase.pilot import main
+    out, rid, args = _planted_run(env, tmp_path, readout=True)
+    main(args + ["--stages", "lmid", "--layers", "24", "--null-layers", "24", "--all-token-layers", "",
+                 "--n-null-last", "200"])
+    res = json.load(open(os.path.join(out, rid, "lmid_model.json")))
+    assert res["checks"]["readout_L24_reproduces_preds_hans_eval"] >= 0.99
+    pc = res["configs"]["c_LABEL|24|cls"]                     # xoá nhãn trước pooler -> DEV-M (60 ví dụ) tụt mạnh
+    assert pc["devm_acc_base"] > 0.95 and pc["after"]["devm_acc"] <= pc["devm_acc_base"] - 0.3
+    cells = pd.read_csv(os.path.join(out, "lmid_cells_all.csv")).set_index(["concept", "column"])
+    for col in ("SUB", "CON"):
+        r = cells.loc[("c_SUB", col)]
+        assert r.dRG < -0.5 and r.p_N3 < 0.01 and r.q_bh < 0.05 and bool(r.cell_robust_this_seed)
+    for col in ("LO", "SUB", "CON"):
+        assert abs(cells.loc[("c_CTRL_H", col), "dRG"]) < 0.05
+        assert cells.loc[("c_CON", col), "p_N3"] > 0.01 or cells.loc[("c_CON", col), "dRG"] > -0.05
+    assert os.path.exists(os.path.join(out, rid, "lmid_nulls.npz"))
+    text = open(os.path.join(out, "lmid_summary.md")).read()
+    assert "Control dương theo tầng" in text and "Ma trận ΔRG theo tầng" in text
+
+
+# ------------------------------------------------------------------ can thiệp trong mô hình (SPEC_ERASURE §11.4)
+def _tiny_bert(layers=3, seed=0):
+    from transformers import BertConfig, BertForSequenceClassification
+    torch.manual_seed(seed)
+    cfg = BertConfig(vocab_size=60, hidden_size=32, num_hidden_layers=layers, num_attention_heads=2,
+                     intermediate_size=64, max_position_embeddings=64, num_labels=2)
+    return BertForSequenceClassification(cfg).eval()
+
+
+def _batch(seed=0):
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.randint(5, 60, (5, 11), generator=g)
+    am = torch.ones_like(ids)
+    am[0, 7:] = 0
+    am[3, 4:] = 0
+    return {"input_ids": ids, "attention_mask": am, "token_type_ids": torch.zeros_like(ids)}
+
+
+def _rand_eraser(d, rank=1, seed=0):
+    from khoaluan.erase.leace_fast import TorchEraser
+    g = torch.Generator().manual_seed(seed)
+    Q, _ = torch.linalg.qr(torch.randn(d, rank, generator=g))
+    A = torch.randn(d, rank, generator=g)                  # chiếu xiên (P_L ≠ P_Rᵀ) như LEACE
+    return TorchEraser(torch.randn(d, generator=g), A, (Q.T @ A).inverse() @ Q.T, rank)
+
+
+def test_continuer_identity_and_states_match_forward():
+    from khoaluan.erase.layers import Continuer
+    m = _tiny_bert()
+    b = _batch()
+    with torch.no_grad():
+        ref = m(**b, output_hidden_states=True)
+    with Continuer(m, [0, 1, 2]) as c:
+        lg0, _ = c.prefix(b)
+        assert torch.equal(lg0, ref.logits)
+        for l in (0, 1, 2):
+            assert torch.allclose(c.state(l), ref.hidden_states[l], atol=1e-6)     # hidden_states[ℓ] = đầu vào layer[ℓ]
+            lg, _ = c.finish(l, c.state(l))
+            assert torch.allclose(lg, ref.logits, atol=1e-6)                       # eraser đồng nhất == forward gốc
+    assert all(len(blk._forward_pre_hooks) == 0 for blk in m.bert.encoder.layer)   # gỡ hook khi xong
+
+
+@pytest.mark.parametrize("mode", ["cls", "all"])
+def test_continuer_matches_forward_hook(mode):
+    """Eraser KHÁC đồng nhất: chạy tiếp từ trạng thái đã ghi == sửa đầu ra layer[ℓ−1] bằng forward hook rồi forward lại."""
+    from khoaluan.erase.layers import Continuer, apply_eraser
+    m = _tiny_bert()
+    b = _batch(1)
+    er = _rand_eraser(32, rank=2, seed=3)
+    with torch.no_grad():
+        ref = m(**b).logits
+    with Continuer(m, [1, 2]) as c:
+        c.prefix(b)
+        for l in (1, 2):
+            lg, _ = c.finish(l, apply_eraser(c.state(l), er, mode, b["attention_mask"]))
+
+            def hk(_mod, _inp, out):
+                h = out[0] if isinstance(out, tuple) else out
+                h2 = apply_eraser(h, er, mode, b["attention_mask"])
+                return (h2,) + tuple(out[1:]) if isinstance(out, tuple) else h2
+            hdl = m.bert.encoder.layer[l - 1].register_forward_hook(hk)
+            with torch.no_grad():
+                lh = m(**b).logits
+            hdl.remove()
+            assert torch.allclose(lg, lh, atol=1e-6)
+            assert (lg - ref).abs().max() > 1e-4                                    # can thiệp có tác dụng
+
+
+def test_all_token_mode_ignores_padding():
+    """mode 'all' chỉ sửa token thật: kết quả của một ví dụ không đổi khi thêm padding."""
+    from khoaluan.erase.layers import Continuer, apply_eraser
+    m = _tiny_bert()
+    b = _batch(2)
+    er = _rand_eraser(32, seed=4)
+    with Continuer(m, [1]) as c:
+        c.prefix(b)
+        lg_pad, _ = c.finish(1, apply_eraser(c.state(1), er, "all", b["attention_mask"]))
+        i = 3
+        n = int(b["attention_mask"][i].sum())
+        bi = {k: v[i:i + 1, :n] for k, v in b.items()}
+        c.prefix(bi)
+        lg_one, _ = c.finish(1, apply_eraser(c.state(1), er, "all", bi["attention_mask"]))
+    assert torch.allclose(lg_pad[i], lg_one[0], atol=1e-5)
+
+
+def test_readout_matches_model(env):
+    """ℓ = L tính từ cache [CLS]_L qua pooler + head đọc từ checkpoint == logits của mô hình."""
+    from transformers import AutoModelForSequenceClassification
+    from khoaluan.erase.layers import Readout
+    m = AutoModelForSequenceClassification.from_pretrained(env["tiny"]).eval()
+    b = _batch(0)
+    b["input_ids"] = b["input_ids"] % m.config.vocab_size
+    with torch.no_grad():
+        o = m(**b, output_hidden_states=True)
+    ro = Readout(env["tiny"], torch.device("cpu"))
+    lg, _ = ro.from_pre(ro.pre(o.hidden_states[-1][:, 0].numpy()))
+    assert torch.allclose(lg, o.logits, atol=1e-5)
+    er = _rand_eraser(m.config.hidden_size, seed=5)
+    X = o.hidden_states[-1][:, 0]
+    a = ro.from_pre(ro.erased_pre(ro.pre(X.numpy()), X, er))[0]
+    assert torch.allclose(a, ro.from_pre(ro.pre(er(X).numpy()))[0], atol=1e-5)    # cập nhật hạng thấp == tính thẳng
 
 
 def test_pilot_end_to_end_with_tiny_bert(env, tmp_path):
@@ -255,20 +444,38 @@ def test_pilot_end_to_end_with_tiny_bert(env, tmp_path):
              "--set", f"model_name={tiny}", "--set", "fp16=false", "--set", "use_cpu=true",
              "--set", "num_train_epochs=1", "--std-layers", "1-2"])
     out = str(tmp_path / "erase")
-    models, cells = main(["--data-root", dd, "--runs-root", runs, "--out", out, "--run-ids", "bertL-mnliB-100-s11",
-                          "--n-null", "30", "--n-label", "400", "--allow-unofficial-data", "--batch", "16"])
     rid = "bertL-mnliB-100-s11"
-    for f in ["pool_pooler.npy", "pool_logits.npy", "erase_cells.csv", "nulls.npz", "erase_model.json"]:
+    common = ["--data-root", dd, "--runs-root", runs, "--out", out, "--run-ids", rid, "--n-null", "30",
+              "--n-label", "400", "--n-label-big", "800", "--n-resample", "3", "--allow-unofficial-data",
+              "--batch", "16", "--cls-layers", "1,2", "--layers", "1,2", "--all-token-layers", "1",
+              "--null-layers", "1,2", "--n-null-last", "20", "--n-null-mid-n3", "8", "--n-null-mid-n1", "4",
+              "--null-subset-per-subcase", "3"]
+    models, cells = main(common + ["--stages", "lout,lmid"])
+    for f in ["pool_pooler.npy", "pool_logits.npy", "pool_cls.npy", "pool_meta.json", "erase_cells.csv", "nulls.npz",
+              "erase_model.json", "lmid_model.json", "lmid_cells.csv", "lmid_nulls.npz"]:
         assert os.path.exists(os.path.join(out, rid, f)), f
-    for f in ["erase_summary.md", "erase_cells_all.csv", "sets/sets_report.json", "sets/set_c_LO.parquet"]:
+    for f in ["erase_summary.md", "erase_cells_all.csv", "lmid_summary.md", "lmid_cells_all.csv",
+              "sets/sets_report.json", "sets/set_c_LO.parquet", "sets/set_c_LO_resamples.parquet"]:
         assert os.path.exists(os.path.join(out, f)), f
     assert len(cells) == 5 * 3 and cells.p_N3.between(0, 1).all()
     res = json.load(open(os.path.join(out, rid, "erase_model.json")))
     assert res["checks"]["head_reproduces_preds_hans_eval"] >= 0.99
-    assert set(res["concepts"]) == {"c_LABEL", "c_LO", "c_SUB", "c_CON", "c_JOINT", "c_CTRL_H"}
+    assert set(res["concepts"]) == {"c_LABEL", "c_LABEL_40K", "c_LO", "c_SUB", "c_CON", "c_JOINT", "c_CTRL_H"}
+    lm = json.load(open(os.path.join(out, rid, "lmid_model.json")))
+    assert lm["checks"]["identity_continuation_max_abs_logit_diff"] < 1e-5
+    assert lm["checks"]["live_reproduces_preds_hans_eval"] >= 0.99
+    assert lm["checks"]["readout_L2_reproduces_preds_hans_eval"] >= 0.99
+    lc = pd.read_csv(os.path.join(out, rid, "lmid_cells.csv"))
+    # tầng 1: cls + all cho c_LO/c_SUB/c_CON, cls cho c_JOINT/c_CTRL_H; tầng 2 (= L): chỉ cls
+    assert len(lc[(lc.layer == 1) & (lc["mode"] == "cls")]) == 15 and len(lc[(lc.layer == 1) & (lc["mode"] == "all")]) == 9
+    assert len(lc[lc.layer == 2]) == 15 and set(lc[lc.layer == 2]["mode"]) == {"cls"}
+    withnull = lc[lc.p_N3.notna()]
+    assert set(withnull.concept) == {"c_LO", "c_SUB", "c_CON"} and len(withnull) == 2 * 9
+    assert withnull.q_bh.between(0, 1).all()
+    assert (withnull[withnull.layer == 1].n_N3 == 8).all() and (withnull[withnull.layer == 2].n_N3 == 20).all()
+    assert "c_SUB|1|all" in lm["configs"] and "recovery_pooler_held" in lm["configs"]["c_SUB|1|cls"]
     # lần chạy thứ hai dùng lại cache MNLI-POOL đã trích, kết quả quan sát giống hệt
-    _, cells2 = main(["--data-root", dd, "--runs-root", runs, "--out", out, "--run-ids", rid, "--n-null", "30",
-                      "--n-label", "400", "--allow-unofficial-data"])
+    _, cells2 = main(common + ["--stages", "lout"])
     assert np.allclose(cells.dRG, cells2.dRG)
 
 

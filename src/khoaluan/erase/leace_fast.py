@@ -80,6 +80,32 @@ class Eraser:
         """D = X − μ (torch, n×d) tính sẵn; W_cls (2×d). Trả về Δlogit (n×2) = −(D P_Rᵀ)(W_cls P_L)ᵀ."""
         return -((D @ self.PR.T) @ (W_cls @ self.PL).T)
 
+    def on(self, device, dtype=torch.float32):
+        """Bản tensor trên thiết bị (dùng cho can thiệp trong mô hình, L_ℓ)."""
+        return TorchEraser(self.mu.to(device, dtype), self.PL.to(device, dtype), self.PR.to(device, dtype), self.rank)
+
+
+class TorchEraser:
+    def __init__(self, mu, PL, PR, rank):
+        self.mu, self.PL, self.PR, self.rank = mu, PL, PR, rank
+
+    def __call__(self, X):
+        """X (..., d) cùng thiết bị; tính theo dtype của eraser (tắt autocast để phép chiếu không bị hạ xuống fp16),
+        trả về dtype của X."""
+        with torch.autocast(device_type=X.device.type, enabled=False):
+            Xf = X.to(self.mu.dtype)
+            return (Xf - ((Xf - self.mu) @ self.PR.T) @ self.PL.T).to(X.dtype)
+
+
+def mean_diff_direction(X, z, W):
+    """Hướng khái niệm nhị phân trong không gian whitened chung: W (μ_1 − μ_0) / ‖·‖.
+    Với Z one-hot 2 lớp, W Σ_xz có hạng 1 và cùng phương với W(μ_1 − μ_0) -> chính là hướng LEACE xoá (SPEC_DULIEU §6.1
+    bước 7: cosine giữa các hướng xoá trong không gian whitened; dùng chung một W để các hướng so được với nhau)."""
+    X = torch.as_tensor(np.asarray(X), dtype=DT)
+    z = np.asarray(z)
+    v = W @ (X[z == 1].mean(0) - X[z == 0].mean(0))
+    return (v / v.norm()).numpy()
+
 
 def var_removed(stats, eraser):
     """VarRemoved = 1 − tr(Σ_{h'}) / tr(Σ_h) trên tập fit (dùng covariance mẫu, không co rút)."""
